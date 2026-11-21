@@ -25,6 +25,9 @@ import db
 
 logging.basicConfig(format="%(asctime)s %(levelname)s %(name)s: %(message)s", level=logging.INFO)
 log = logging.getLogger("bot")
+# httpx écrit l'URL de Telegram (donc le token) dans les logs : on le fait taire
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("httpcore").setLevel(logging.WARNING)
 
 TOKEN = os.environ.get("BOT_TOKEN", "")
 ADMIN_IDS = {
