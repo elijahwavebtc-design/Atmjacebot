@@ -1,130 +1,399 @@
-import os, io, csv, sqlite3, random, asyncio
-from telegram import Update
-from telegram.ext import Application, CommandHandler, MessageHandler, ContextTypes, filters
+"""Bot Telegram d'inscription et de diffusion.
 
-TOKEN = os.environ["TOKEN"]
-ADMIN_ID = int(os.environ["ADMIN_ID"])
-CODES_VALIDES = None   # ou {"AFF001", "AFF002"} pour n'accepter que certains codes
+Variables d'environnement :
+  BOT_TOKEN  : token donné par @BotFather
+  ADMIN_IDS  : ton identifiant Telegram (plusieurs possibles, séparés par des virgules)
+  DB_PATH    : chemin de la base (ex. /data/bot.db sur Railway avec un volume)
+"""
+import asyncio
+import functools
+import logging
+import os
 
-db = sqlite3.connect(os.environ.get("DB_PATH", "bot.db"), check_same_thread=False)
-db.execute("""CREATE TABLE IF NOT EXISTS users (
-    chat_id INTEGER PRIMARY KEY, code TEXT, grp TEXT DEFAULT 'T',
-    nom TEXT, username TEXT, date TEXT DEFAULT CURRENT_TIMESTAMP)""")
-db.commit()
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram.error import BadRequest, Forbidden, RetryAfter, TelegramError
+from telegram.ext import (
+    Application,
+    CallbackQueryHandler,
+    CommandHandler,
+    ContextTypes,
+    MessageHandler,
+    filters,
+)
 
-def total(): return db.execute("SELECT COUNT(*) FROM users").fetchone()[0]
+import db
 
-def membres(g):
-    if g == "T":
-        rows = db.execute("SELECT chat_id FROM users").fetchall()
-    else:
-        rows = db.execute("SELECT chat_id FROM users WHERE grp LIKE ?", (g + "%",)).fetchall()
-    return [r[0] for r in rows]
+logging.basicConfig(format="%(asctime)s %(levelname)s %(name)s: %(message)s", level=logging.INFO)
+log = logging.getLogger("bot")
 
-def admin_only(f):
+TOKEN = os.environ.get("BOT_TOKEN", "")
+ADMIN_IDS = {
+    int(x) for x in os.environ.get("ADMIN_IDS", "").replace(" ", "").split(",") if x.strip().isdigit()
+}
+
+THANKS = (
+    "✅ Merci pour votre inscription ! Vous êtes bien inscrit.\n"
+    "Les signaux vous seront communiqués ici dès que possible."
+)
+LABELS = {"A": "le groupe A", "B": "le groupe B", "TOUS": "tous les inscrits", "AFFILIES": "les affiliés"}
+ALIASES = {"AFFILIÉS": "AFFILIES", "AFFILIE": "AFFILIES", "AFFILIÉ": "AFFILIES", "TOUT": "TOUS"}
+
+BG_TASKS = set()  # envois en cours
+
+
+def busy():
+    return any(not t.done() for t in BG_TASKS)
+
+
+def admin_only(fn):
+    """Les non-admins sont ignorés en silence : les inscrits ne voient aucune commande."""
+
+    @functools.wraps(fn)
     async def wrapper(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-        if update.effective_user.id == ADMIN_ID:
-            await f(update, ctx)
+        user = update.effective_user
+        if not user or user.id not in ADMIN_IDS:
+            return
+        return await fn(update, ctx)
+
     return wrapper
 
+
+def confirm_kb(action):
+    return InlineKeyboardMarkup(
+        [[InlineKeyboardButton("✅ Confirmer", callback_data=f"ok:{action}"),
+          InlineKeyboardButton("❌ Annuler", callback_data="cancel")]]
+    )
+
+
+# ====================== côté inscrits ======================
 async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id == ADMIN_ID:
+    ctx.user_data.pop("await_code", None)
+    if ctx.args:  # lien d'affiliation : t.me/TonBot?start=CODE
+        code = db.norm(ctx.args[0])
+        if db.code_exists(code):
+            ctx.user_data["pending_code"] = code
+    user = update.effective_user
+    if db.is_registered(user.id):
+        rows = []
+        if not db.has_code(user.id):
+            rows.append([InlineKeyboardButton("🎁 J'ai un code d'affiliation", callback_data="have_code")])
         await update.message.reply_text(
-            "Mode admin.\n/stats : nombre d'inscrits\n/liste : liste des inscrits\n"
-            "/choisir A : choisir le groupe cible\n/split A : diviser un groupe\n"
-            "/delete A : supprimer un groupe\n/reset : tout remettre dans un seul groupe\n"
-            "Ensuite, écris ton message normalement : il part au groupe choisi.")
+            "Vous êtes déjà inscrit ✅\nLes signaux vous seront communiqués ici.",
+            reply_markup=InlineKeyboardMarkup(rows) if rows else None,
+        )
     else:
-        await update.message.reply_text("Bienvenue ! Envoie ton code d'affiliation pour t'inscrire.")
+        kb = InlineKeyboardMarkup([[InlineKeyboardButton("✅ S'inscrire", callback_data="register")]])
+        await update.message.reply_text("Bienvenue ! Appuyez sur le bouton pour vous inscrire.", reply_markup=kb)
+    if user.id in ADMIN_IDS:
+        await update.message.reply_text("Tu es admin : tape /aide pour voir les commandes.")
 
-async def diffuser(ctx, ids, texte, cible):
-    ok = 0
-    for chat_id in ids:
-        try:
-            await ctx.bot.send_message(chat_id, texte)
-            ok += 1
-        except Exception:
-            pass
-        await asyncio.sleep(0.05)
-    await ctx.bot.send_message(ADMIN_ID, f"✅ Terminé : {ok}/{len(ids)} reçus (groupe {cible}).")
 
-async def texte(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    u = update.effective_user
-    if u.id == ADMIN_ID:
-        cible = ctx.bot_data.get("cible")
-        if not cible:
-            await update.message.reply_text("Choisis d'abord un groupe : /choisir T (tous), /choisir A...")
+async def on_register(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    user = q.from_user
+    db.register(user.id, user.username, user.first_name)
+    pending = ctx.user_data.pop("pending_code", None)
+    if pending:
+        db.apply_code(user.id, pending)
+    rows = []
+    if not db.has_code(user.id):
+        rows.append([InlineKeyboardButton("🎁 J'ai un code d'affiliation", callback_data="have_code")])
+    text = THANKS + ("\n🎁 Votre code d'affiliation a bien été pris en compte." if pending and db.has_code(user.id) else "")
+    try:
+        await q.edit_message_text(text, reply_markup=InlineKeyboardMarkup(rows) if rows else None)
+    except BadRequest:
+        pass
+
+
+async def on_have_code(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    if not db.is_registered(q.from_user.id):
+        await q.message.reply_text("Appuyez d'abord sur /start pour vous inscrire.")
+        return
+    ctx.user_data["await_code"] = True
+    await q.message.reply_text("Envoyez-moi votre code d'affiliation :")
+
+
+async def on_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    msg = update.effective_message
+
+    # --- l'admin est en train de préparer un envoi ---
+    if user.id in ADMIN_IDS:
+        pending = ctx.user_data.get("pending_send")
+        if pending and "message_id" not in pending:
+            pending["from_chat_id"] = msg.chat_id
+            pending["message_id"] = msg.message_id
+            n = len(db.recipients(pending["target"]))
+            await msg.reply_text(
+                f"Envoyer ce message à {n} personne(s) ({LABELS[pending['target']]}) ?",
+                reply_markup=confirm_kb("envoyer"),
+            )
             return
-        ids = membres(cible)
-        await update.message.reply_text(f"Envoi à {len(ids)} personnes (groupe {cible})...")
-        ctx.application.create_task(diffuser(ctx, ids, update.message.text, cible))
+
+    # --- un inscrit saisit son code d'affiliation ---
+    if ctx.user_data.get("await_code") and msg.text:
+        status = db.apply_code(user.id, msg.text)
+        if status == "ok":
+            ctx.user_data.pop("await_code", None)
+            await msg.reply_text("🎁 Code d'affiliation accepté, merci !")
+        elif status == "already":
+            ctx.user_data.pop("await_code", None)
+            await msg.reply_text("Un code d'affiliation est déjà enregistré pour vous ✅")
+        elif status == "invalid":
+            await msg.reply_text("Ce code n'est pas valide. Réessayez, ou tapez /start pour annuler.")
+        else:
+            ctx.user_data.pop("await_code", None)
+            await msg.reply_text("Appuyez d'abord sur /start pour vous inscrire.")
         return
-    if db.execute("SELECT 1 FROM users WHERE chat_id=?", (u.id,)).fetchone():
+
+    if db.is_registered(user.id):
+        await msg.reply_text("Vous êtes bien inscrit ✅ Les signaux vous seront communiqués ici.")
+    else:
+        await msg.reply_text("Appuyez sur /start pour vous inscrire.")
+
+
+# ====================== côté admin ======================
+@admin_only
+async def aide(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        "Commandes admin (invisibles pour les inscrits) :\n\n"
+        "/stats : nombre d'inscrits et de membres par groupe\n"
+        "/diviser : répartit au hasard tous les inscrits en groupe A et groupe B (moitié/moitié)\n"
+        "/envoyer A : envoie un message au groupe A (idem B, TOUS, AFFILIES)\n"
+        "/supprimer A : supprime tous les membres du groupe A (idem B)\n"
+        "/annuler : annule un envoi en préparation\n\n"
+        "Codes d'affiliation :\n"
+        "/code_ajouter CODE\n"
+        "/code_supprimer CODE\n"
+        "/codes : liste des codes et nombre d'utilisateurs\n\n"
+        "Pour /envoyer : tape la commande, puis envoie ton message (texte, ou image avec légende). "
+        "Le bot demande confirmation, puis l'envoie à chaque personne une par une."
+    )
+
+
+@admin_only
+async def stats(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    s = db.stats()
+    await update.message.reply_text(
+        "📊 Statistiques\n"
+        f"Inscrits : {s['total']}\n"
+        f"Groupe A : {s['a']}\n"
+        f"Groupe B : {s['b']}\n"
+        f"Sans groupe : {s['sans_groupe']}\n"
+        f"Avec code d'affiliation : {s['affilies']}\n"
+        f"Ayant bloqué le bot : {s['bloques']}"
+    )
+
+
+@admin_only
+async def diviser(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if busy():
+        await update.message.reply_text("Un envoi est en cours, attends qu'il soit terminé.")
         return
-    code = update.message.text.strip().upper()
-    if CODES_VALIDES is not None and code not in CODES_VALIDES:
-        await update.message.reply_text("Code invalide, réessaie.")
+    n = len(db.recipients("TOUS"))
+    if n < 2:
+        await update.message.reply_text("Il faut au moins 2 inscrits pour diviser.")
         return
-    db.execute("INSERT INTO users (chat_id, code, grp, nom, username) VALUES (?,?,?,?,?)",
-               (u.id, code, "T", u.full_name, u.username or ""))
-    db.commit()
-    await update.message.reply_text("Inscription enregistrée ✅")
-    await ctx.bot.send_message(ADMIN_ID, f"Nouvelle inscription : {u.full_name}\nTotal : {total()}")
+    await update.message.reply_text(
+        f"Diviser au hasard les {n} inscrits en deux groupes (A et B) ? "
+        "Les groupes actuels seront remplacés.",
+        reply_markup=confirm_kb("diviser"),
+    )
+
 
 @admin_only
-async def choisir(update, ctx):
-    g = ctx.args[0].upper()
-    ctx.bot_data["cible"] = g
-    await update.message.reply_text(f"Groupe cible : {g} ({len(membres(g))} personnes). Écris ton message.")
-
-@admin_only
-async def split(update, ctx):
-    g = ctx.args[0].upper()
-    ids = [r[0] for r in db.execute("SELECT chat_id FROM users WHERE grp=?", (g,)).fetchall()]
-    if not ids:
-        await update.message.reply_text("Aucun membre direct dans ce groupe (déjà divisé ?).")
+async def envoyer(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if busy():
+        await update.message.reply_text("Un envoi est déjà en cours, attends qu'il soit terminé.")
         return
-    random.shuffle(ids)
-    m = len(ids) // 2
-    a, b = ("A", "B") if g == "T" else (g + "A", g + "B")
-    db.executemany("UPDATE users SET grp=? WHERE chat_id=?", [(a, i) for i in ids[:m]])
-    db.executemany("UPDATE users SET grp=? WHERE chat_id=?", [(b, i) for i in ids[m:]])
-    db.commit()
-    await update.message.reply_text(f"{g} divisé : {a} = {m}, {b} = {len(ids) - m}")
+    target = db.norm(ctx.args[0]) if ctx.args else ""
+    target = ALIASES.get(target, target)
+    if target not in LABELS:
+        await update.message.reply_text("Utilisation : /envoyer A, /envoyer B, /envoyer TOUS ou /envoyer AFFILIES")
+        return
+    n = len(db.recipients(target))
+    if n == 0:
+        await update.message.reply_text(f"Personne dans {LABELS[target]} pour l'instant.")
+        return
+    ctx.user_data["pending_send"] = {"target": target}
+    await update.message.reply_text(
+        f"OK, {n} personne(s) dans {LABELS[target]}.\n"
+        "Envoie maintenant ton message (texte, ou image avec légende). /annuler pour abandonner."
+    )
+
 
 @admin_only
-async def delete(update, ctx):
-    g = ctx.args[0].upper()
-    db.execute("DELETE FROM users WHERE grp LIKE ?", (g + "%",))
-    db.commit()
-    ctx.bot_data.pop("cible", None)
-    await update.message.reply_text(f"Groupe {g} supprimé. Total restant : {total()}")
+async def supprimer(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if busy():
+        await update.message.reply_text("Un envoi est en cours, attends qu'il soit terminé.")
+        return
+    g = db.norm(ctx.args[0]) if ctx.args else ""
+    if g not in ("A", "B"):
+        await update.message.reply_text("Utilisation : /supprimer A ou /supprimer B")
+        return
+    n = len(db.recipients(g))
+    if n == 0:
+        await update.message.reply_text(f"Le groupe {g} est vide.")
+        return
+    await update.message.reply_text(
+        f"Supprimer définitivement les {n} membres du groupe {g} ? (impossible à annuler)",
+        reply_markup=confirm_kb(f"supprimer:{g}"),
+    )
+
 
 @admin_only
-async def reset(update, ctx):
-    db.execute("UPDATE users SET grp='T'")
-    db.commit()
-    ctx.bot_data.pop("cible", None)
-    await update.message.reply_text(f"Tout le monde est de nouveau dans un seul groupe ({total()} personnes).")
+async def annuler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    ctx.user_data.pop("pending_send", None)
+    await update.message.reply_text("Envoi annulé.")
+
 
 @admin_only
-async def stats(update, ctx):
-    rows = db.execute("SELECT grp, COUNT(*) FROM users GROUP BY grp ORDER BY grp").fetchall()
-    lignes = "\n".join(f"{g} : {n}" for g, n in rows)
-    await update.message.reply_text(f"Total inscrits : {total()}\n{lignes}")
+async def code_ajouter(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if not ctx.args:
+        await update.message.reply_text("Utilisation : /code_ajouter MONCODE")
+        return
+    db.add_code(ctx.args[0])
+    await update.message.reply_text(f"Code {db.norm(ctx.args[0])} ajouté ✅")
+
 
 @admin_only
-async def liste(update, ctx):
-    rows = db.execute("SELECT nom, username, code, grp, date FROM users ORDER BY date").fetchall()
-    buf = io.StringIO()
-    csv.writer(buf).writerows([("nom", "username", "code", "groupe", "date")] + rows)
-    f = io.BytesIO(buf.getvalue().encode("utf-8"))
-    f.name = "inscrits.csv"
-    await update.message.reply_document(f)
+async def code_supprimer(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if not ctx.args:
+        await update.message.reply_text("Utilisation : /code_supprimer MONCODE")
+        return
+    ok = db.remove_code(ctx.args[0])
+    await update.message.reply_text("Code supprimé ✅" if ok else "Ce code n'existe pas.")
 
-app = Application.builder().token(TOKEN).build()
-for nom, fn in [("start", start), ("choisir", choisir), ("split", split), ("delete", delete),
-                ("reset", reset), ("stats", stats), ("liste", liste)]:
-    app.add_handler(CommandHandler(nom, fn))
-app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, texte))
-app.run_polling()
+
+@admin_only
+async def codes(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    rows = db.list_codes()
+    if not rows:
+        await update.message.reply_text("Aucun code. Ajoutes-en avec /code_ajouter MONCODE")
+        return
+    await update.message.reply_text("Codes d'affiliation :\n" + "\n".join(f"{c} : {n} inscrit(s)" for c, n in rows))
+
+
+@admin_only
+async def on_confirm(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    action = q.data[3:]
+
+    if action == "diviser":
+        if busy():
+            await q.edit_message_text("Un envoi est en cours, réessaie plus tard.")
+            return
+        a, b = db.split()
+        await q.edit_message_text(f"✅ Division faite : groupe A = {a}, groupe B = {b}.")
+
+    elif action.startswith("supprimer:"):
+        if busy():
+            await q.edit_message_text("Un envoi est en cours, réessaie plus tard.")
+            return
+        g = action.split(":", 1)[1]
+        n = db.delete_group(g)
+        await q.edit_message_text(f"✅ Groupe {g} supprimé ({n} membres).")
+
+    elif action == "envoyer":
+        pending = ctx.user_data.pop("pending_send", None)
+        if not pending or "message_id" not in pending:
+            await q.edit_message_text("Aucun message en attente. Recommence avec /envoyer.")
+            return
+        if busy():
+            await q.edit_message_text("Un envoi est déjà en cours.")
+            return
+        ids = db.recipients(pending["target"])
+        await q.edit_message_text(f"🚀 Envoi lancé à {len(ids)} personne(s). Je te préviens à la fin.")
+        task = asyncio.create_task(
+            broadcast(ctx.bot, q.message.chat_id, pending["from_chat_id"], pending["message_id"], ids)
+        )
+        BG_TASKS.add(task)
+        task.add_done_callback(BG_TASKS.discard)
+
+
+@admin_only
+async def on_cancel(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    ctx.user_data.pop("pending_send", None)
+    await q.edit_message_text("Annulé.")
+
+
+# ====================== envoi un par un ======================
+async def safe_send(bot, chat_id, text):
+    try:
+        await bot.send_message(chat_id, text)
+    except TelegramError as e:
+        log.warning("Message à l'admin impossible : %s", e)
+
+
+async def broadcast(bot, admin_chat_id, from_chat_id, message_id, user_ids):
+    sent = blocked = failed = 0
+    total = len(user_ids)
+    for i, uid in enumerate(user_ids, 1):
+        for _ in range(3):
+            try:
+                # copy_message garde le texte, l'image, la légende et la mise en forme
+                await bot.copy_message(chat_id=uid, from_chat_id=from_chat_id, message_id=message_id)
+                sent += 1
+                break
+            except RetryAfter as e:
+                wait = e.retry_after
+                wait = wait.total_seconds() if hasattr(wait, "total_seconds") else wait
+                await asyncio.sleep(wait + 1)
+            except Forbidden:
+                db.mark_blocked(uid)
+                blocked += 1
+                break
+            except TelegramError as e:
+                log.warning("Échec pour %s : %s", uid, e)
+                failed += 1
+                break
+        else:
+            failed += 1
+        await asyncio.sleep(0.05)  # ~20 messages/s, sous la limite de Telegram (30/s)
+        if i % 1000 == 0 and i != total:
+            await safe_send(bot, admin_chat_id, f"Progression : {i}/{total}")
+    await safe_send(
+        bot,
+        admin_chat_id,
+        f"✅ Envoi terminé : {sent} envoyés, {blocked} ont bloqué le bot, {failed} échecs (sur {total}).",
+    )
+
+
+# ====================== démarrage ======================
+def main():
+    if not TOKEN:
+        raise SystemExit("BOT_TOKEN manquant.")
+    if not ADMIN_IDS:
+        raise SystemExit("ADMIN_IDS manquant (ton identifiant Telegram, obtenu via @userinfobot).")
+    db.init()
+    app = Application.builder().token(TOKEN).build()
+
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("aide", aide))
+    app.add_handler(CommandHandler("stats", stats))
+    app.add_handler(CommandHandler("diviser", diviser))
+    app.add_handler(CommandHandler("envoyer", envoyer))
+    app.add_handler(CommandHandler("supprimer", supprimer))
+    app.add_handler(CommandHandler("annuler", annuler))
+    app.add_handler(CommandHandler("code_ajouter", code_ajouter))
+    app.add_handler(CommandHandler("code_supprimer", code_supprimer))
+    app.add_handler(CommandHandler("codes", codes))
+
+    app.add_handler(CallbackQueryHandler(on_register, pattern=r"^register$"))
+    app.add_handler(CallbackQueryHandler(on_have_code, pattern=r"^have_code$"))
+    app.add_handler(CallbackQueryHandler(on_confirm, pattern=r"^ok:"))
+    app.add_handler(CallbackQueryHandler(on_cancel, pattern=r"^cancel$"))
+    app.add_handler(MessageHandler(filters.ChatType.PRIVATE & ~filters.COMMAND, on_message))
+
+    log.info("Bot démarré (%d admin).", len(ADMIN_IDS))
+    app.run_polling()
+
+
+if __name__ == "__main__":
+    main()
