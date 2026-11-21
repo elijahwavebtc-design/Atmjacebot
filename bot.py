@@ -38,6 +38,20 @@ THANKS = (
     "✅ Merci pour votre inscription ! Vous êtes bien inscrit.\n"
     "Les signaux vous seront communiqués ici dès que possible."
 )
+ASK_CODE = (
+    "Avant de finaliser votre inscription : disposez-vous d'un code d'affiliation ?\n\n"
+    "🎁 Le code d'affiliation vous donne droit à un signal de trading supplémentaire "
+    "lors de la prochaine session."
+)
+ENTER_CODE = "Parfait. Veuillez saisir votre code d'affiliation :"
+CODE_OK = (
+    "🎁 Votre code d'affiliation a bien été enregistré. "
+    "Vous bénéficierez d'un signal de trading supplémentaire lors de la prochaine session."
+)
+CODE_BAD = (
+    "Ce code d'affiliation n'est pas valide. Veuillez le vérifier et le saisir à nouveau, "
+    "ou poursuivre votre inscription sans code."
+)
 LABELS = {"A": "le groupe A", "B": "le groupe B", "TOUS": "tous les inscrits", "AFFILIES": "les affiliés"}
 ALIASES = {"AFFILIÉS": "AFFILIES", "AFFILIE": "AFFILIES", "AFFILIÉ": "AFFILIES", "TOUT": "TOUS"}
 
@@ -91,32 +105,73 @@ async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Tu es admin : tape /aide pour voir les commandes.")
 
 
-async def on_register(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    q = update.callback_query
-    await q.answer()
-    user = q.from_user
+def finish_signup(user, code):
+    """Enregistre l'inscrit (avec son code s'il y en a un) et renvoie le message final."""
     db.register(user.id, user.username, user.first_name)
-    pending = ctx.user_data.pop("pending_code", None)
-    if pending:
-        db.apply_code(user.id, pending)
-    rows = []
-    if not db.has_code(user.id):
-        rows.append([InlineKeyboardButton("🎁 J'ai un code d'affiliation", callback_data="have_code")])
-    text = THANKS + ("\n🎁 Votre code d'affiliation a bien été pris en compte." if pending and db.has_code(user.id) else "")
+    if code:
+        db.apply_code(user.id, code)
+    return THANKS + ("\n\n" + CODE_OK if code and db.has_code(user.id) else "")
+
+
+async def edit_or_ignore(q, text, markup=None):
     try:
-        await q.edit_message_text(text, reply_markup=InlineKeyboardMarkup(rows) if rows else None)
+        await q.edit_message_text(text, reply_markup=markup)
     except BadRequest:
         pass
 
 
+NO_CODE_KB = InlineKeyboardMarkup([[InlineKeyboardButton("Poursuivre sans code", callback_data="register_no")]])
+
+
+async def on_register(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Appui sur « S'inscrire » : on demande d'abord s'il y a un code d'affiliation."""
+    q = update.callback_query
+    await q.answer()
+    user = q.from_user
+    if db.is_registered(user.id):
+        await edit_or_ignore(q, "Vous êtes déjà inscrit ✅\nLes signaux vous seront communiqués ici.")
+        return
+    pending = ctx.user_data.pop("pending_code", None)  # code déjà fourni par un lien d'affiliation
+    if pending:
+        await edit_or_ignore(q, finish_signup(user, pending))
+        return
+    kb = InlineKeyboardMarkup(
+        [[InlineKeyboardButton("✅ Oui, j'ai un code", callback_data="register_yes"),
+          InlineKeyboardButton("❌ Non", callback_data="register_no")]]
+    )
+    await edit_or_ignore(q, ASK_CODE, kb)
+
+
+async def on_register_yes(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    if db.is_registered(q.from_user.id):
+        await edit_or_ignore(q, "Vous êtes déjà inscrit ✅\nLes signaux vous seront communiqués ici.")
+        return
+    ctx.user_data["await_code"] = "signup"
+    await edit_or_ignore(q, ENTER_CODE, NO_CODE_KB)
+
+
+async def on_register_no(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    ctx.user_data.pop("await_code", None)
+    user = q.from_user
+    if db.is_registered(user.id):
+        await edit_or_ignore(q, "Vous êtes déjà inscrit ✅\nLes signaux vous seront communiqués ici.")
+        return
+    await edit_or_ignore(q, finish_signup(user, None))
+
+
 async def on_have_code(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Pour un inscrit qui veut ajouter son code plus tard."""
     q = update.callback_query
     await q.answer()
     if not db.is_registered(q.from_user.id):
         await q.message.reply_text("Appuyez d'abord sur /start pour vous inscrire.")
         return
-    ctx.user_data["await_code"] = True
-    await q.message.reply_text("Envoyez-moi votre code d'affiliation :")
+    ctx.user_data["await_code"] = "later"
+    await q.message.reply_text(ENTER_CODE)
 
 
 async def on_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -137,19 +192,23 @@ async def on_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             return
 
     # --- un inscrit saisit son code d'affiliation ---
-    if ctx.user_data.get("await_code") and msg.text:
-        status = db.apply_code(user.id, msg.text)
-        if status == "ok":
-            ctx.user_data.pop("await_code", None)
-            await msg.reply_text("🎁 Code d'affiliation accepté, merci !")
-        elif status == "already":
-            ctx.user_data.pop("await_code", None)
-            await msg.reply_text("Un code d'affiliation est déjà enregistré pour vous ✅")
-        elif status == "invalid":
-            await msg.reply_text("Ce code n'est pas valide. Réessayez, ou tapez /start pour annuler.")
+    mode = ctx.user_data.get("await_code")
+    if mode and msg.text:
+        code = db.norm(msg.text)
+        if not db.code_exists(code):
+            await msg.reply_text(CODE_BAD, reply_markup=NO_CODE_KB if mode == "signup" else None)
+            return
+        ctx.user_data.pop("await_code", None)
+        if mode == "signup":
+            await msg.reply_text(finish_signup(user, code))
         else:
-            ctx.user_data.pop("await_code", None)
-            await msg.reply_text("Appuyez d'abord sur /start pour vous inscrire.")
+            status = db.apply_code(user.id, code)
+            if status == "ok":
+                await msg.reply_text(CODE_OK)
+            elif status == "already":
+                await msg.reply_text("Un code d'affiliation est déjà enregistré pour vous ✅")
+            else:
+                await msg.reply_text("Appuyez d'abord sur /start pour vous inscrire.")
         return
 
     if db.is_registered(user.id):
@@ -389,6 +448,8 @@ def main():
     app.add_handler(CommandHandler("codes", codes))
 
     app.add_handler(CallbackQueryHandler(on_register, pattern=r"^register$"))
+    app.add_handler(CallbackQueryHandler(on_register_yes, pattern=r"^register_yes$"))
+    app.add_handler(CallbackQueryHandler(on_register_no, pattern=r"^register_no$"))
     app.add_handler(CallbackQueryHandler(on_have_code, pattern=r"^have_code$"))
     app.add_handler(CallbackQueryHandler(on_confirm, pattern=r"^ok:"))
     app.add_handler(CallbackQueryHandler(on_cancel, pattern=r"^cancel$"))
