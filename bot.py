@@ -10,8 +10,14 @@ import functools
 import logging
 import os
 
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
-from telegram.error import BadRequest, Forbidden, RetryAfter, TelegramError
+from telegram import (
+    BotCommand,
+    BotCommandScopeChat,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    Update,
+)
+from telegram.error import BadRequest, Forbidden, NetworkError, RetryAfter, TelegramError
 from telegram.ext import (
     Application,
     CallbackQueryHandler,
@@ -69,10 +75,19 @@ def admin_only(fn):
     async def wrapper(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         user = update.effective_user
         if not user or user.id not in ADMIN_IDS:
+            # visible seulement dans les logs Railway, jamais par l'utilisateur
+            log.warning("Commande admin '%s' REFUSÉE : l'identifiant %s n'est pas dans ADMIN_IDS",
+                        fn.__name__, user.id if user else "?")
             return
+        log.info("Commande admin '%s' par %s", fn.__name__, user.id)
         return await fn(update, ctx)
 
     return wrapper
+
+
+def ready(pending):
+    """Un envoi est prêt quand le texte ou le message à copier est connu."""
+    return bool(pending) and ("text" in pending or "message_id" in pending)
 
 
 def confirm_kb(action):
@@ -181,7 +196,7 @@ async def on_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     # --- l'admin est en train de préparer un envoi ---
     if user.id in ADMIN_IDS:
         pending = ctx.user_data.get("pending_send")
-        if pending and "message_id" not in pending:
+        if pending and not ready(pending):
             pending["from_chat_id"] = msg.chat_id
             pending["message_id"] = msg.message_id
             n = len(db.recipients(pending["target"]))
@@ -211,7 +226,13 @@ async def on_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 await msg.reply_text("Appuyez d'abord sur /start pour vous inscrire.")
         return
 
-    if db.is_registered(user.id):
+    if user.id in ADMIN_IDS:
+        await msg.reply_text(
+            "Pour envoyer un message : /envoyer A (ou B, TOUS, AFFILIES), puis écris ton message.\n"
+            "Ou tout en une fois : /envoyer A Ton message ici\n"
+            "Toutes les commandes : /aide"
+        )
+    elif db.is_registered(user.id):
         await msg.reply_text("Vous êtes bien inscrit ✅ Les signaux vous seront communiqués ici.")
     else:
         await msg.reply_text("Appuyez sur /start pour vous inscrire.")
@@ -279,6 +300,15 @@ async def envoyer(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     n = len(db.recipients(target))
     if n == 0:
         await update.message.reply_text(f"Personne dans {LABELS[target]} pour l'instant.")
+        return
+    # « /envoyer A Bonjour à tous » : le message est déjà dans la commande
+    parts = (update.message.text or "").split(None, 2)
+    if len(parts) > 2 and parts[2].strip():
+        ctx.user_data["pending_send"] = {"target": target, "text": parts[2].strip()}
+        await update.message.reply_text(
+            f"Envoyer ce message à {n} personne(s) ({LABELS[target]}) ?\n\n{parts[2].strip()}",
+            reply_markup=confirm_kb("envoyer"),
+        )
         return
     ctx.user_data["pending_send"] = {"target": target}
     await update.message.reply_text(
@@ -362,7 +392,7 @@ async def on_confirm(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     elif action == "envoyer":
         pending = ctx.user_data.pop("pending_send", None)
-        if not pending or "message_id" not in pending:
+        if not ready(pending):
             await q.edit_message_text("Aucun message en attente. Recommence avec /envoyer.")
             return
         if busy():
@@ -370,9 +400,7 @@ async def on_confirm(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             return
         ids = db.recipients(pending["target"])
         await q.edit_message_text(f"🚀 Envoi lancé à {len(ids)} personne(s). Je te préviens à la fin.")
-        task = asyncio.create_task(
-            broadcast(ctx.bot, q.message.chat_id, pending["from_chat_id"], pending["message_id"], ids)
-        )
+        task = asyncio.create_task(broadcast(ctx.bot, q.message.chat_id, pending, ids))
         BG_TASKS.add(task)
         task.add_done_callback(BG_TASKS.discard)
 
@@ -393,14 +421,21 @@ async def safe_send(bot, chat_id, text):
         log.warning("Message à l'admin impossible : %s", e)
 
 
-async def broadcast(bot, admin_chat_id, from_chat_id, message_id, user_ids):
+async def send_one(bot, uid, src):
+    if "text" in src:  # message tapé directement dans la commande /envoyer
+        await bot.send_message(chat_id=uid, text=src["text"])
+    else:  # copy_message garde le texte, l'image, la légende et la mise en forme
+        await bot.copy_message(chat_id=uid, from_chat_id=src["from_chat_id"], message_id=src["message_id"])
+
+
+async def broadcast(bot, admin_chat_id, src, user_ids):
     sent = blocked = failed = 0
     total = len(user_ids)
+    log.info("Envoi lancé à %d personne(s)", total)
     for i, uid in enumerate(user_ids, 1):
         for _ in range(3):
             try:
-                # copy_message garde le texte, l'image, la légende et la mise en forme
-                await bot.copy_message(chat_id=uid, from_chat_id=from_chat_id, message_id=message_id)
+                await send_one(bot, uid, src)
                 sent += 1
                 break
             except RetryAfter as e:
@@ -425,16 +460,47 @@ async def broadcast(bot, admin_chat_id, from_chat_id, message_id, user_ids):
         admin_chat_id,
         f"✅ Envoi terminé : {sent} envoyés, {blocked} ont bloqué le bot, {failed} échecs (sur {total}).",
     )
+    log.info("Envoi terminé : %d envoyés, %d bloqués, %d échecs", sent, blocked, failed)
 
 
 # ====================== démarrage ======================
+ADMIN_MENU = [
+    BotCommand("aide", "Liste des commandes"),
+    BotCommand("stats", "Nombre d'inscrits et groupes"),
+    BotCommand("diviser", "Diviser les inscrits en groupes A et B"),
+    BotCommand("envoyer", "Envoyer un message : /envoyer A, B, TOUS ou AFFILIES"),
+    BotCommand("supprimer", "Supprimer un groupe : /supprimer A ou B"),
+    BotCommand("codes", "Liste des codes d'affiliation"),
+    BotCommand("code_ajouter", "Ajouter un code : /code_ajouter MONCODE"),
+    BotCommand("code_supprimer", "Supprimer un code"),
+    BotCommand("annuler", "Annuler un envoi en préparation"),
+]
+
+
+async def post_init(app):
+    """Affiche le menu des commandes seulement dans le chat de l'admin."""
+    for admin_id in ADMIN_IDS:
+        try:
+            await app.bot.set_my_commands(ADMIN_MENU, scope=BotCommandScopeChat(admin_id))
+        except TelegramError as e:
+            log.warning("Menu des commandes impossible pour %s : %s", admin_id, e)
+
+
+async def on_error(update, ctx: ContextTypes.DEFAULT_TYPE):
+    if isinstance(ctx.error, NetworkError):  # coupure passagère côté Telegram : la bibliothèque réessaie
+        log.warning("Coupure réseau Telegram (réessai automatique) : %s", ctx.error)
+    else:
+        log.error("Erreur dans un handler", exc_info=ctx.error)
+
+
 def main():
     if not TOKEN:
         raise SystemExit("BOT_TOKEN manquant.")
     if not ADMIN_IDS:
         raise SystemExit("ADMIN_IDS manquant (ton identifiant Telegram, obtenu via @userinfobot).")
     db.init()
-    app = Application.builder().token(TOKEN).build()
+    app = Application.builder().token(TOKEN).post_init(post_init).build()
+    app.add_error_handler(on_error)
 
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("aide", aide))
